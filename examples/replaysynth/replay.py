@@ -51,9 +51,7 @@ def _synth(replay_path: pathlib.Path, out_path: pathlib.Path, url: str | None = 
             (e.get("data", {}).get("href", "") for e in events if e.get("type") == 4), ""
         ) or "https://example.com"
 
-    # One Dom per FullSnapshot — rrweb renumbers node ids per page load.
-    doms = [replaysynth.Dom(e["data"]) for e in events if e.get("type") == 2]
-    acts = replaysynth.extract_actions(events, doms, start_url)
+    acts = replaysynth.extract_actions(events)
     code = replaysynth.to_python(acts, start_url, standalone=False)
     out_path.write_text(code, encoding="utf-8")
     print(f"[replay] synthesized {len(acts)} actions -> {out_path}")

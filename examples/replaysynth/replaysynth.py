@@ -7,10 +7,19 @@ replays them.
 
 The core trick: rrweb gives every node a globally-unique `id` and each
 interaction (click / input) references that id. We reconstruct the DOM from
-the FullSnapshot, index nodes by id, and synthesize a robust CSS selector per
-interaction by walking a fallback chain (id -> data-testid -> name/type ->
-aria-label -> visible text/role -> structural path). Coordinates in rrweb are
-unreliable (often 0,0), so we never trust them.
+FullSnapshots *and* keep it current with IncrementalSnapshot mutations (adds,
+removes, attribute changes), then synthesize a robust locator per interaction.
+Coordinates in rrweb are unreliable (often 0,0), so we never trust them.
+
+Locator strategy (in priority order):
+  1. #id
+  2. [data-testid] / [data-test] / [data-cy] / [data-qa] / [data-id]
+  3. [name] / [placeholder] / [aria-label]
+  4. associated <label>   -> page.get_by_label(...)
+  5. button/a text        -> page.get_by_role("button"|"link", name=...)
+  6. explicit [role]      -> page.get_by_role(role, name=...)
+  7. visible text         -> page.get_by_text(...)
+  8. structural path      -> page.locator("form > ...")
 
 Run as a module:
     python -m replaysynth fixture.ndjson  -> writes replay.py to stdout
@@ -20,13 +29,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
 # --------------------------------------------------------------------------- #
-# 1. DOM reconstruction from the FullSnapshot
+# 1. DOM reconstruction + rrweb incremental mutations
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -49,6 +59,21 @@ class Node:
 
 
 class Dom:
+    """A live DOM index, seeded from a FullSnapshot and kept current by mutations.
+
+    ReplaySynth applies the subset of rrweb IncrementalSnapshot mutation events
+    that affect element identity and selector synthesis:
+      - adds: new nodes inserted into the tree
+      - removes: nodes detached (removed from by_id so no stale selector is used)
+      - attributes: id / class / data-* / aria-* changes
+      - texts: textContent changes (used for visible-text selectors)
+
+    It does NOT attempt to implement rrweb's full mutation surface (e.g.
+    characterData in the middle of a text node, or moved nodes). If a mutation
+    references a parentId we don't know, the subtree is skipped — the worst
+    case is a missed interaction, not a wrong selector.
+    """
+
     def __init__(self, full_snapshot: dict) -> None:
         self.by_id: dict[int, Node] = {}
         self.root = self._build(full_snapshot["node"])
@@ -81,14 +106,110 @@ class Dom:
     def get(self, node_id: int) -> Optional[Node]:
         return self.by_id.get(node_id)
 
+    # ---- mutation application --------------------------------------------- #
+
+    def apply_mutation(self, mutation: dict) -> None:
+        """Apply one rrweb IncrementalSnapshot mutation payload.
+
+        Supported keys (rrweb 2.x):
+          texts:      [{id, value}]
+          attributes: [{id, attributes: {k: v | None}}]
+          removes:    [{parentId, id}]
+          adds:       [{parentId, nextId, node}]
+        """
+        for t in mutation.get("texts") or []:
+            node = self.by_id.get(t.get("id"))
+            if node and node.is_text:
+                node.text = t.get("value", node.text)
+
+        for a in mutation.get("attributes") or []:
+            node = self.by_id.get(a.get("id"))
+            if node and node.is_element:
+                for k, v in (a.get("attributes") or {}).items():
+                    if v is None:
+                        node.attrs.pop(k, None)
+                    else:
+                        node.attrs[k] = str(v)
+
+        for r in mutation.get("removes") or []:
+            node = self.by_id.get(r.get("id"))
+            if node:
+                self._detach(node)
+
+        for a in mutation.get("adds") or []:
+            parent = self.by_id.get(a.get("parentId"))
+            if parent is None:
+                # Parent unknown (maybe it was removed or is inside an iframe
+                # we don't track). Skip the subtree rather than guess.
+                continue
+            raw = a.get("node")
+            if not raw:
+                continue
+            node = self._build(raw)
+            node.parent = parent
+            next_id = a.get("nextId")
+            if next_id is not None:
+                for i, child in enumerate(parent.children):
+                    if child.id == next_id:
+                        parent.children.insert(i, node)
+                        break
+                else:
+                    parent.children.append(node)
+            else:
+                parent.children.append(node)
+
+    def _detach(self, node: Node) -> None:
+        """Remove a node and its descendants from the index and its parent."""
+        if node.parent is not None:
+            try:
+                node.parent.children.remove(node)
+            except ValueError:
+                pass
+        # Recursively drop from the id index so no stale reference is used.
+        for child in list(node.children):
+            self._detach(child)
+        self.by_id.pop(node.id, None)
+        node.parent = None
+
 
 # --------------------------------------------------------------------------- #
-# 2. Selector synthesis (the whole point)
+# 2. Locator model + selector synthesis
 # --------------------------------------------------------------------------- #
+
+@dataclass
+class Locator:
+    """A structured Playwright locator: how to find the element, not a string."""
+    kind: str  # css | role | label | text
+    value: str  # CSS selector, or ARIA role, or label/text content
+    name: Optional[str] = None  # accessible name for role locators
+
+    def emit(self) -> str:
+        """Emit the exact Playwright Python expression."""
+        if self.kind == "css":
+            return f'page.locator("{_py_str(self.value)}")'
+        if self.kind == "role":
+            if self.name:
+                return f'page.get_by_role("{_py_str(self.value)}", name="{_py_str(self.name)}", exact=True)'
+            return f'page.get_by_role("{_py_str(self.value)}")'
+        if self.kind == "label":
+            return f'page.get_by_label("{_py_str(self.value)}")'
+        if self.kind == "text":
+            return f'page.get_by_text("{_py_str(self.value)}")'
+        raise ValueError(f"unknown locator kind: {self.kind}")
+
+
+# HTML input types that act as buttons (not text fields).
+_BUTTON_INPUT_TYPES = {"submit", "button", "reset", "image"}
+
 
 def _safe_css(value: str) -> str:
     """Escape a value for use inside a CSS attribute selector value."""
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _py_str(s: str) -> str:
+    """Escape a string for embedding inside a double-quoted Python string literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
 
 
 def _visible_text(node: Node) -> str:
@@ -98,14 +219,11 @@ def _visible_text(node: Node) -> str:
     return "".join(c.text for c in node.children if c.is_text and c.text).strip()
 
 
-def _argmax_int(attrs: dict[str, str]) -> Optional[str]:
-    """Longest single-space token as a proxy for a stable-looking selector attr."""
-    for key in ("data-cy", "data-test", "data-testid"):
-        if attrs.get(key):
-            candidates = attrs[key].split()
-            if candidates:
-                return max(candidates, key=len)
-    return None
+def _all_text(node: Node) -> str:
+    """Recursively collect visible text (used for accessible names)."""
+    if node.is_text:
+        return node.text
+    return "".join(_all_text(c) for c in node.children)
 
 
 def _label_for(node: Node) -> Optional[str]:
@@ -132,59 +250,65 @@ def _label_for(node: Node) -> Optional[str]:
 
 
 def _display_text(node: Node) -> Optional[str]:
-    """Text content of a button/link/a used for a text= selector."""
-    txt = _visible_text(node)
+    """Text content of a button/link/a used for an accessible-name locator."""
+    txt = _all_text(node).strip()
     if not txt:
         return None
     # Don't use long/complex text as a selector; keep role-ish phrases short.
-    return txt if len(txt) <= 40 else txt.split()[0]
+    return txt if len(txt) <= 60 else txt.split()[0]
 
 
-def synthesize(node: Node) -> Optional[str]:
-    """Pick the most robust CSS selector for a node, deterministic and readable."""
+def synthesize(node: Node) -> Optional[Locator]:
+    """Pick the most robust locator for a node, deterministic and readable."""
     if not node.is_element:
         return None
 
     # Tier 1: durable, unique id attribute.
     if node.attrs.get("id"):
-        return f"#{_safe_css(node.attrs['id'])}"
+        return Locator("css", f"#{_safe_css(node.attrs['id'])}")
 
     # Tier 2: common test-hook / component attributes.
     for attr in ("data-testid", "data-test", "data-cy", "data-qa", "data-id"):
         if node.attrs.get(attr):
-            return f'[{attr}="{_safe_css(node.attrs[attr])}"]'
+            return Locator("css", f'[{attr}="{_safe_css(node.attrs[attr])}"]')
 
-    # Tier 3: stable structural control attrs (name / type / placeholder).
-    for attr in ("name", "placeholder", "aria-label", "data-name", "data-field"):
+    # Tier 3: stable structural control attrs (name / placeholder / aria-label).
+    for attr in ("name", "placeholder", "aria-label"):
         if node.attrs.get(attr) and node.attrs[attr] not in ("", "undefined"):
-            return f'[{attr}="{_safe_css(node.attrs[attr])}"]'
+            return Locator("css", f'[{attr}="{_safe_css(node.attrs[attr])}"]')
 
     # Tier 4: accessible-name via associated <label>.
     label = _label_for(node)
     if label:
-        return f'get_by_label("{_py_str(label)}")'  # placeholder, resolved later
+        return Locator("label", label)
 
-    # Tier 5: visible text for role-ish elements (button, a, span with text).
-    text = _display_text(node)
+    # Tier 5: buttons and links by accessible role + visible text.
     if node.tag in ("button", "a"):
-        # Buttons/links: prefer accessible-name (visible text OR role). If the
-        # element has no visible text (e.g. a <button> containing only an icon),
-        # fall back to an exact role locator — the most robust option.
         role = "button" if node.tag == "button" else "link"
+        text = _display_text(node)
         if text:
-            return f'get_by_role("{role}", name="{_py_str(text)}", exact=True)'
-        # No text: default to the first matching role; usually unique enough.
-        return f'get_by_role("{role}")'
-    if text and node.tag in ("span", "summary", "li", "h1", "h2", "h3", "p", "td"):
-        return f'text="{_py_str(text)}"'
+            return Locator("role", role, name=text)
+        return Locator("role", role)
 
-    # Tier 6: role-based (only for explicit roles we care about).
+    # Tier 5b: input[type=submit|button|reset|image] are buttons with a value label.
+    if node.tag == "input" and node.attrs.get("type") in _BUTTON_INPUT_TYPES:
+        value = node.attrs.get("value", "").strip()
+        if value:
+            return Locator("role", "button", name=value)
+        return Locator("role", "button")
+
+    # Tier 5c: explicit ARIA role.
     role = node.attrs.get("role")
     if role:
-        return f'get_by_role("{_safe_css(role)}", name="{_py_str(_display_text(node) or "")}")'
+        return Locator("role", role, name=_display_text(node) or None)
+
+    # Tier 6: visible text on text-carrying elements.
+    text = _display_text(node)
+    if text and node.tag in ("span", "summary", "li", "h1", "h2", "h3", "h4", "p", "td", "th", "div"):
+        return Locator("text", text)
 
     # Tier 7: structural path — tag + nth-of-type within its parent.
-    return structural_path(node)
+    return Locator("css", structural_path(node))
 
 
 def structural_path(node: Node) -> str:
@@ -205,97 +329,124 @@ def structural_path(node: Node) -> str:
     return " > ".join(chain) if chain else (cur.tag if cur else "")
 
 
-def _py_str(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _safe_py_quote(s: str) -> str:
-    """Quote a string for embedding inside a Playwright CSS selector value."""
-    # Playwright CSS :has-text() wants the raw text; escape CSS-wise (no quotes needed
-    # for the arg when we wrap in double quotes at the py level — but colons/commas break it).
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
 # --------------------------------------------------------------------------- #
 # 3. Interaction extraction
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class Action:
-    kind: str  # click | fill | check | uncheck | goto
-    selector: str = ""
+    kind: str  # click | fill | check | uncheck
+    locator: Locator
     value: str = ""
     comment: str = ""
-    url: str = ""  # for goto
     field: str = ""  # field name for secrets resolution (password/redacted fills)
 
 
-def extract_actions(events: list[dict], doms: list, start_url: str) -> list[Action]:
+def _is_incremental_prefix(prev: str, curr: str) -> bool:
+    """True if curr looks like an incremental typing step toward prev.
+
+    e.g. prev="u", curr="ut" -> True (we're still typing the same field)
+         prev="utku", curr="utku" -> True (no-op, same value)
+         prev="hello", curr="world" -> False (a real change, not a prefix)
+    """
+    if prev == curr:
+        return True
+    if not prev or not curr:
+        return False
+    return curr.startswith(prev) or prev.startswith(curr)
+
+
+def extract_actions(events: list[dict]) -> list[Action]:
     """Turn an rrweb stream into a minimal, read-only action list.
 
-    `doms` is a list of (event_index, Dom) pairs, one per FullSnapshot. Each
-    interaction is resolved against the MOST RECENT FullSnapshot that preceded
-    it — rrweb renumbers node ids on every page load, so ids from one snapshot
-    are meaningless in another. We walk the interaction's id against the latest
-    preceding DOM, falling back to earlier ones if the id is a content node.
+    Handles multiple FullSnapshots (page navigation renumbers node ids) and
+    IncrementalSnapshot mutations (dynamic DOM changes after the snapshot).
+    Each interaction is resolved against the DOM state at that point in the
+    event stream.
     """
     acts: list[Action] = []
-    seen_fill: dict[int, str] = {}  # node id -> last fill value (collapse repeats)
-    latest_dom: Optional[Dom] = None
-    latest_idx: int = -1
+    dom: Optional[Dom] = None
+    # Track the last fill per field name (not per node id) so we can collapse
+    # incremental typing into one final fill. A click/navigation resets the
+    # "same logical interaction" window.
+    last_fill: dict[str, Action] = {}  # field_name -> the Action we emitted
 
     for ev in events:
         etype = ev.get("type")
-        if etype == 2:
-            # A new FullSnapshot begins a new id namespace.
-            latest_dom = Dom(ev["data"])
-            latest_idx = latest_dom.root.id if latest_dom.root else -1
+
+        if etype == 2:  # FullSnapshot — new id namespace.
+            dom = Dom(ev["data"])
+            last_fill.clear()
             continue
-        if etype != 3:
+
+        if etype != 3:  # IncrementalSnapshot
             continue
+
         data = ev.get("data", {})
         source = data.get("source")
+
+        if source == 0 and dom is not None:  # Mutation
+            dom.apply_mutation(data)
+            continue
 
         if source == 2:  # MouseInteraction
             mtype = data.get("type")
             # 2 = Click. rrweb reports the DEEPEST hit-test element (often an icon
             # or inner span); walk up to a real interactive ancestor (button/a).
             if mtype == 2:
-                node = _resolve(latest_dom, data.get("id", -1))
-                node = _clickable_ancestor(node, latest_dom)
+                node = _resolve(dom, data.get("id", -1))
+                node = _clickable_ancestor(node)
                 if node is None:
                     continue
-                sel = synthesize(node)
-                if sel:
-                    acts.append(Action(kind="click", selector=sel, comment=_visible_text(node)[:40]))
+                loc = synthesize(node)
+                if loc:
+                    # A click ends any incremental-typing sequence.
+                    last_fill.clear()
+                    acts.append(Action(kind="click", locator=loc,
+                                       comment=_visible_text(node)[:40]))
             # ignore mousemove/down/up/over — noise
 
         elif source == 5:  # Input
-            node = _resolve(latest_dom, data.get("id", -1))
+            node = _resolve(dom, data.get("id", -1))
             if node is None or not node.is_element:
                 continue
             value = data.get("text", "")
             is_checked = data.get("isChecked", False)
-            attr_type = node.attrs.get("type", "")
-            if attr_type == "checkbox" or attr_type == "radio":
+            attr_type = (node.attrs.get("type") or "").lower()
+            field_name = node.attrs.get("name") or node.attrs.get("id") or ""
+
+            if attr_type in ("checkbox", "radio"):
                 kind = "check" if is_checked else "uncheck"
-                acts.append(Action(kind=kind, selector=synthesize(node) or "", comment=_visible_text(node)[:30]))
-            else:
-                prev = seen_fill.get(data.get("id"))
-                if prev != value:
-                    # rrweb masks password fields — the value is a run of '*'
-                    # (e.g. '****'). Mark it so the caller can supply the real
-                    # secret at replay time (forever-login without re-auth).
-                    if attr_type == "password" or set(value) <= {"*"} and value:
-                        val = "[REDACTED]"
-                    else:
-                        val = value
-                    sel = synthesize(node) or ""
-                    field_name = node.attrs.get("name") or node.attrs.get("id") or ""
-                    acts.append(Action(kind="fill", selector=sel, value=val,
-                                       comment=(node.attrs.get("id") or node.attrs.get("name") or "")[:30],
-                                       field=field_name))
-                seen_fill[data.get("id")] = value
+                loc = synthesize(node)
+                if loc:
+                    last_fill.clear()
+                    acts.append(Action(kind=kind, locator=loc,
+                                       comment=field_name[:30]))
+                continue
+
+            # Text-like input. rrweb masks password fields to a run of '*'.
+            is_password = attr_type == "password" or (value and set(value) <= {"*"})
+            emit_value = "[REDACTED]" if is_password else value
+            loc = synthesize(node)
+            if not loc:
+                continue
+
+            prev = last_fill.get(field_name)
+            if prev is not None:
+                if is_password and prev.value == "[REDACTED]":
+                    # Same password field, still typing — all values are '*'
+                    # runs, so keep the single redacted action.
+                    continue
+                if _is_incremental_prefix(prev.value, value):
+                    # Same field, still typing — replace the previous action's
+                    # value instead of emitting a new one.
+                    prev.value = emit_value
+                    continue
+
+            act = Action(kind="fill", locator=loc, value=emit_value,
+                         comment=field_name[:30], field=field_name)
+            acts.append(act)
+            last_fill[field_name] = act
 
         elif source == 3:  # Scroll — ignore
             continue
@@ -304,27 +455,27 @@ def extract_actions(events: list[dict], doms: list, start_url: str) -> list[Acti
 
 
 def _resolve(dom: Optional[Dom], node_id: int) -> Optional[Node]:
-    """Resolve a node id against the latest DOM, else walk back isn't possible
-    here (single passed dom) — but if absent, drop a hint by searching content."""
     if dom is not None:
         return dom.get(node_id)
     return None
 
 
-def _clickable_ancestor(node: Optional[Node], dom: Optional[Dom]) -> Optional[Node]:
+def _clickable_ancestor(node: Optional[Node]) -> Optional[Node]:
     """Walk up from a hit-tested leaf to the nearest interactive element.
 
     rrweb records the DEEPEST element under the pointer — often an <i> icon or a
     <span> inside a <button>. Clicking that leaf directly is valid but produces
-    brittle selectors; climb to the enclosing button/a instead.
+    brittle selectors; climb to the enclosing button/a/input[type=submit|button]
+    instead.
     """
     if node is None:
         return None
-    cur = node
+    cur: Optional[Node] = node
     while cur is not None:
-        if cur.is_element and cur.tag in ("button", "a", "input[type=submit]", "select", "textarea"):
-            # normalize a bare tag check
-            if cur.tag == "button" or cur.tag == "a":
+        if cur.is_element:
+            if cur.tag in ("button", "a", "select", "textarea"):
+                return cur
+            if cur.tag == "input" and (cur.attrs.get("type") or "").lower() in _BUTTON_INPUT_TYPES:
                 return cur
         cur = cur.parent
     return node  # nothing better; use the leaf
@@ -338,42 +489,24 @@ def actions_body(acts: list[Action]) -> list[str]:
     """The core action statements, as a list of code lines (no wrapper)."""
     lines: list[str] = []
     for act in acts:
-        if act.kind == "goto":
-            lines.append(f'        await page.goto("{_py_str(act.url)}")')
-        elif act.kind == "click":
-            sel = act.selector
+        loc = act.locator.emit()
+        if act.kind == "click":
             if act.comment:
                 lines.append(f"        # click {act.comment}")
-            if sel.startswith("text="):
-                txt = _safe_py_quote(sel[5:])
-                lines.append(f'        await page.locator(":has-text({txt})").click()')
-            elif sel.startswith("get_by_label"):
-                inner = sel[len("get_by_label("):-1]
-                lines.append(f'        await page.locator("label:has-text({inner})").click()')
-            elif sel.startswith("get_by_role"):
-                parts = sel[len("get_by_role("):-1]
-                lines.append(f'        await page.get_by_role({parts}).click()')
-            else:
-                lines.append(f'        await page.locator("{_py_str(sel)}").click()')
+            lines.append(f"        await {loc}.click()")
         elif act.kind == "fill":
-            # rrweb masks passwords to '[REDACTED]' — at replay time pull the real
-            # value from the caller-supplied `secrets` dict (keyed by field name).
             if act.value == "[REDACTED]":
                 fill_expr = f'secrets.get("{_py_str(act.field)}", "[REDACTED]")'
             else:
                 fill_expr = f'"{_py_str(act.value)}"'
-            lines.append(f'        # fill {act.comment or "input"}')
-            css = act.selector if not act.selector.startswith(("text=", "get_by_")) else None
-            if css:
-                lines.append(f'        await page.locator("{_py_str(css)}").fill({fill_expr})')
-            else:
-                lines.append(f'        await page.locator("{_py_str(act.selector)}").fill({fill_expr})')
+            lines.append(f"        # fill {act.comment or 'input'}")
+            lines.append(f"        await {loc}.fill({fill_expr})")
         elif act.kind == "check":
             lines.append(f"        # check {act.comment or 'checkbox'}")
-            lines.append(f'        await page.locator("{_py_str(act.selector)}").check()')
+            lines.append(f"        await {loc}.check()")
         elif act.kind == "uncheck":
             lines.append(f"        # uncheck {act.comment or 'checkbox'}")
-            lines.append(f'        await page.locator("{_py_str(act.selector)}").uncheck()')
+            lines.append(f"        await {loc}.uncheck()")
         lines.append("")
     return lines
 
@@ -478,16 +611,7 @@ def main() -> int:
     if not start_url:
         start_url = "about:blank"
 
-    # Build one Dom per FullSnapshot so interactions resolve against the right
-    # id-space epoch.
-    doms: list[Dom] = []
-    for ev in events:
-        if ev.get("type") == 2:
-            doms.append(Dom(ev["data"]))
-
-    dom = doms[-1] if doms else None
-    acts = extract_actions(events, doms, start_url)
-
+    acts = extract_actions(events)
     code = to_python(acts, start_url, standalone=not args.replay_only)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
