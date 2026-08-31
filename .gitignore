@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 venv/
 screenshot.png
+*.ndjson
+replay_proof.png
+generated_replay.py
+generated_login_replay.py
