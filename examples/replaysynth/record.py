@@ -28,6 +28,23 @@ import pathlib
 import sys
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from a .env next to this script (no dependency).
+
+    Existing environment variables win (setdefault), so a real export always
+    overrides the file. .env is gitignored — the key never leaves your disk.
+    """
+    env_path = pathlib.Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
 async def _release_and_download(solari, session_id: str, out_path: str) -> None:
     """Release a session, wait for the async replay upload, and save the NDJSON."""
     # close() already released the session; replay becomes available after release.
@@ -65,6 +82,7 @@ async def main() -> None:
                       help="path to a .py of Playwright actions to run after load")
     args = ap.parse_args()
 
+    _load_dotenv()
     api_key = os.environ.get("SOLARI_API_KEY")
     if not api_key:
         raise SystemExit("SOLARI_API_KEY not set — grab one at console.getsolari.com")

@@ -184,12 +184,19 @@ class Locator:
     name: Optional[str] = None  # accessible name for role locators
 
     def emit(self) -> str:
-        """Emit the exact Playwright Python expression."""
+        """Emit the exact Playwright Python expression.
+
+        Role locators deliberately do NOT use exact=True: the accessible name
+        is computed by the browser (whitespace-normalized, aria-label aware),
+        and our name comes from rrweb's raw textContent which often carries
+        leading/trailing whitespace. Playwright's default matching is
+        normalized substring — the robust choice for replay.
+        """
         if self.kind == "css":
             return f'page.locator("{_py_str(self.value)}")'
         if self.kind == "role":
             if self.name:
-                return f'page.get_by_role("{_py_str(self.value)}", name="{_py_str(self.name)}", exact=True)'
+                return f'page.get_by_role("{_py_str(self.value)}", name="{_py_str(self.name)}")'
             return f'page.get_by_role("{_py_str(self.value)}")'
         if self.kind == "label":
             return f'page.get_by_label("{_py_str(self.value)}")'
@@ -251,7 +258,9 @@ def _label_for(node: Node) -> Optional[str]:
 
 def _display_text(node: Node) -> Optional[str]:
     """Text content of a button/link/a used for an accessible-name locator."""
-    txt = _all_text(node).strip()
+    # Collapse whitespace like the browser's accessible-name computation does —
+    # rrweb's raw textContent often carries leading/trailing whitespace/newlines.
+    txt = " ".join(_all_text(node).split())
     if not txt:
         return None
     # Don't use long/complex text as a selector; keep role-ish phrases short.

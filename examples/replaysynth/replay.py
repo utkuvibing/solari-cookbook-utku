@@ -21,6 +21,19 @@ import pathlib
 import sys
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from a .env next to this script (no dependency)."""
+    env_path = pathlib.Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
 def _load_replay_on(path: str):
     """Import a synthesized `replay_on(page)` from a module file."""
     spec = importlib.util.spec_from_file_location("synthesized_replay", path)
@@ -67,6 +80,8 @@ async def main() -> None:
     ap.add_argument("--secret", action="append", default=[], metavar="NAME=VALUE",
                     help="secret to substitute for a [REDACTED] field (e.g. --secret password=hunter2). Repeatable.")
     args = ap.parse_args()
+
+    _load_dotenv()
 
     # Parse --secret NAME=VALUE pairs into the dict handed to replay_on(page, secrets).
     secrets: dict[str, str] = {}
