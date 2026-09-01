@@ -42,6 +42,15 @@ def _load_replay_on(path: str):
     return mod.replay_on
 
 
+async def _new_page(browser):
+    """Open a page with profile state because the SDK leaves it unapplied."""
+    state = browser.session.storage_state
+    if isinstance(state, dict):
+        context = await browser.new_context(storage_state=state)
+        return await context.new_page()
+    return await browser.new_page()
+
+
 def _synth(replay_path: pathlib.Path, out_path: pathlib.Path, url: str | None = None) -> None:
     """Synthesize replay_on(page) from an rrweb NDJSON file."""
     sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -78,7 +87,7 @@ async def main() -> None:
     ap.add_argument("--synth", default="generated_replay.py", help="where to write the synthesized script")
     ap.add_argument("--stealth", action="store_true", help="launch stealthy (proxy/captcha-capable)")
     ap.add_argument("--secret", action="append", default=[], metavar="NAME=VALUE",
-                    help="secret to substitute for a [REDACTED] field (e.g. --secret password=hunter2). Repeatable.")
+                    help="secret to substitute for a [REDACTED] field (e.g. --secret NAME=VALUE). Repeatable.")
     args = ap.parse_args()
 
     _load_dotenv()
@@ -112,7 +121,7 @@ async def main() -> None:
         browser = await solari.launch(profile_id=profile_id, stealth=args.stealth)
         print(f"[replay] session {browser.id}")
         try:
-            page = await browser.new_page()
+            page = await _new_page(browser)
             start = args.url
             if not start:
                 import json as _json

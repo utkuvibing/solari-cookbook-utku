@@ -94,13 +94,13 @@ def test_static_login():
     events = [
         meta("https://example.com/login"),
         snapshot(page),
-        input_ev(5, "tomsmith", ts=2001),
+        input_ev(5, "demo-user", ts=2001),
         input_ev(6, "****", ts=2002),  # rrweb masks the password
         click(7, ts=2003),
     ]
     acts = replaysynth.extract_actions(events)
     assert len(acts) == 3
-    assert acts[0].kind == "fill" and acts[0].value == "tomsmith"
+    assert acts[0].kind == "fill" and acts[0].value == "demo-user"
     assert acts[1].kind == "fill" and acts[1].value == "[REDACTED]"
     assert acts[1].field == "password"
     assert acts[2].kind == "click"
@@ -108,7 +108,7 @@ def test_static_login():
     code = replaysynth.to_python(acts, "https://example.com/login", standalone=False)
     compile_ok(code)
     assert 'secrets.get("password"' in code
-    assert "SuperSecretPassword" not in code  # real secret never appears
+    assert "DEMO_PASSWORD" not in code  # runtime credential never appears
 
 
 # --------------------------------------------------------------------------- #
@@ -143,82 +143,56 @@ def test_nested_icon_click():
 # 3. label-only field: synthesized locator uses page.get_by_label(...)
 # --------------------------------------------------------------------------- #
 
-def test_label_only_field():
+def test_label_only_field_synthesizes_get_by_label():
+    """A label-wrapped input with no other hooks must use get_by_label()."""
     page = doc([
         el(2, "html", children=[
             el(3, "body", children=[
                 el(4, "form", children=[
-                    el(5, "label", {"for": "email"}, [txt(6, "Email address")]),
-                    # input has NO id/name/testid — only the label identifies it.
-                    # (id present for label[for] to resolve, but no name.)
-                    el(7, "input", {"id": "email", "type": "email"}),
+                    # This is the real label-only HTML pattern: the control is
+                    # nested inside the label and has no id/name/ARIA hook.
+                    el(5, "label", children=[
+                        txt(6, "Email address"),
+                        el(7, "input", {"type": "email"}),
+                    ]),
                 ]),
             ]),
         ]),
     ])
-    events = [snapshot(page), input_ev(7, "user@example.com")]
-    acts = replaysynth.extract_actions(events)
+    acts = replaysynth.extract_actions([
+        snapshot(page),
+        input_ev(7, "user@example.com"),
+    ])
+
     assert len(acts) == 1
-    # id is tier-1, so this specific fixture resolves to #email. Build a variant
-    # where the input truly has no id but label still matches via... actually
-    # label[for] needs id. So instead give it a dynamic-looking id that
-    # synthesize() would still take. The real label-only case: input with only
-    # aria via label. Patch: remove id, give name so label[for] can't match,
-    # and assert tier-3 fires. Then a case with id present -> tier-1.
+    assert acts[0].locator == replaysynth.Locator("label", "Email address")
 
-    # Case A: id present -> #id wins (tier 1), valid.
-    assert acts[0].locator.kind == "css"
+    code = replaysynth.to_python(acts, "about:blank", standalone=False)
+    compile_ok(code)
 
-    # Case B: no id, name present, label[for] cannot match -> [name=...] wins.
-    page_b = doc([
+
+def test_heading_click_uses_exact_heading_role():
+    """A heading click must not over-match another heading containing its text."""
+    page = doc([
         el(2, "html", children=[
             el(3, "body", children=[
-                el(4, "form", children=[
-                    el(5, "label", children=[txt(6, "Email address"),
-                                             el(7, "input", {"name": "email", "type": "email"})]),
-                ]),
+                el(4, "h2", children=[txt(5, "Secure Area")]),
+                el(6, "h4", children=[txt(7, "Welcome to the Secure Area.")]),
             ]),
         ]),
     ])
-    acts_b = replaysynth.extract_actions([snapshot(page_b), input_ev(7, "user@example.com")])
-    assert acts_b[0].locator.kind == "css"  # [name="email"]
+    acts = replaysynth.extract_actions([snapshot(page), click(4)])
 
-    # Case C: label[for] matches, and input has NO tier-1/2/3 attrs.
-    # Give the input only `for`-matching id via label; but id would win tier-1.
-    # To force the label path, the input needs an id that is NOT durable —
-    # synthesize() takes any id at tier 1. So the label tier only fires when
-    # id/name/placeholder/aria-label are all absent. That requires label[for]
-    # matching by name — supported: target = id or name.
-    page_c = doc([
-        el(2, "html", children=[
-            el(3, "body", children=[
-                el(4, "form", children=[
-                    el(5, "label", {"for": "qty"}, [txt(6, "Quantity")]),
-                    el(7, "input", {"name": "qty", "type": "number"}),  # name -> tier 3
-                ]),
-            ]),
-        ]),
-    ])
-    acts_c = replaysynth.extract_actions([snapshot(page_c), input_ev(7, "3")])
-    assert acts_c[0].locator.kind == "css"  # [name="qty"] at tier 3
+    assert len(acts) == 1
+    assert acts[0].locator.kind == "role"
+    assert acts[0].locator.value == "heading"
+    assert acts[0].locator.name == "Secure Area"
+    assert acts[0].locator.exact is True
 
-    # The true label path needs an input with NO identifying attrs at all.
-    # label[for] matching requires id or name, so we use name... which is tier 3.
-    # Conclusion: with the current tier order the label tier is reachable only
-    # when tier-3 attrs are absent — i.e. it fires for label-wrapped inputs
-    # matched by name? No: name itself is tier 3. The label tier is a fallback
-    # for when tiers 1-3 all miss. Keep the test honest: verify get_by_label
-    # emission directly through the Locator class.
-    loc = replaysynth.Locator("label", "Email address")
-    assert loc.emit() == 'page.get_by_label("Email address")'
-    compile_ok(replaysynth.to_python(
-        [replaysynth.Action(kind="fill", locator=loc, value="x")],
-        "about:blank", standalone=False))
+    code = replaysynth.to_python(acts, "about:blank", standalone=False)
+    compile_ok(code)
+    assert 'page.get_by_role("heading", name="Secure Area", exact=True).click()' in code
 
-
-# --------------------------------------------------------------------------- #
-# 4. input[type=submit]
-# --------------------------------------------------------------------------- #
 
 def test_input_submit_button():
     page = doc([
@@ -377,7 +351,7 @@ def test_multiple_fullsnapshots_id_reuse():
     events = [
         meta("https://example.com/login"),
         snapshot(page1, ts=1000),
-        input_ev(5, "tomsmith", ts=2001),      # resolves against page1 -> fill
+        input_ev(5, "demo-user", ts=2001),      # resolves against page1 -> fill
         meta("https://example.com/secure", ts=2500),
         snapshot(page2, ts=3000),               # new id namespace
         click(5, ts=4000),                      # resolves against page2 -> click Logout

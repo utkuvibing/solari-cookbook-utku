@@ -17,6 +17,9 @@ Usage:
     export SOLARI_API_KEY=slr_live_...
     python record.py --url https://example.com --manual --out session.ndjson
     python record.py --url https://example.com --actions actions_login.py --out session.ndjson
+
+    # Profile state is saved only when explicitly requested:
+    python record.py --profile login --save-profile --url https://example.com --actions actions.py
 """
 
 from __future__ import annotations
@@ -43,6 +46,22 @@ def _load_dotenv() -> None:
             continue
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip())
+
+
+def _console_session_id(session_id: str) -> str | None:
+    """Extract the console's UUID from Solari's signed composite session id."""
+    # Browser API session ids are documented as pool:uuid:org:issuedAt.sig.
+    parts = session_id.split(":", 2)
+    return parts[1] if len(parts) == 3 and parts[1] else None
+
+
+async def _new_page(browser):
+    """Open a page with profile state because the SDK leaves it unapplied."""
+    state = browser.session.storage_state
+    if isinstance(state, dict):
+        context = await browser.new_context(storage_state=state)
+        return await context.new_page()
+    return await browser.new_page()
 
 
 async def _release_and_download(solari, session_id: str, out_path: str) -> None:
@@ -72,6 +91,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description="Record a Solari browser session as rrweb NDJSON.")
     ap.add_argument("--url", default="https://example.com", help="page to open")
     ap.add_argument("--profile", default=None, help="reuse a Solari profile by name (skips login)")
+    ap.add_argument("--save-profile", action="store_true",
+                    help="save the session's cookies/localStorage to --profile when finished")
     ap.add_argument(
         "--out", default="session.ndjson", help="where to write the decompressed NDJSON"
     )
@@ -81,6 +102,9 @@ async def main() -> None:
     mode.add_argument("--actions", default=None,
                       help="path to a .py of Playwright actions to run after load")
     args = ap.parse_args()
+
+    if args.save_profile and not args.profile:
+        ap.error("--save-profile requires --profile NAME")
 
     _load_dotenv()
     api_key = os.environ.get("SOLARI_API_KEY")
@@ -99,31 +123,45 @@ async def main() -> None:
 
         browser = await solari.launch(profile_id=profile_id, recording=True)
         session_id = browser.id
-        print(f"[record] session {session_id} (recording)")
+        console_session_id = _console_session_id(session_id)
+        print(f"[record] session ready (recording; console id {console_session_id or 'see sessions list'})")
 
         try:
-            page = await browser.new_page()
+            page = await _new_page(browser)
             await page.goto(args.url)
 
             if args.manual:
-                # Solari browsers don't expose a public stream URL the way
-                # desktops do. The supported manual workflow is:
-                #   1. Open the session in the Solari console live view.
-                #   2. Click through the workflow yourself.
-                #   3. Press ENTER here to finish.
-                console_url = f"https://console.getsolari.com/sessions/{session_id}"
+                # Browser sessions do not expose a public stream URL like
+                # desktops do. The console owns the authenticated observer
+                # connection, so use its real session UUID (not the signed API
+                # capability id) and /live route.
+                sessions_url = "https://console.getsolari.com/sessions"
+                live_url = (
+                    f"https://console.getsolari.com/sessions/{console_session_id}/live"
+                    if console_session_id
+                    else None
+                )
                 print()
                 print("  ┌─────────────────────────────────────────────────────────────┐")
                 print("  │  MANUAL RECORDING — drive the browser yourself             │")
                 print("  └─────────────────────────────────────────────────────────────┘")
                 print()
-                print(f"  1. Open the live view in your browser:")
-                print(f"       {console_url}")
+                if live_url:
+                    print("  1. Open this live-view URL in the Solari Console:")
+                    print(f"       {live_url}")
+                    print("     If it does not open directly, sign in first, open")
+                    print(f"     {sessions_url}, select console id {console_session_id},")
+                    print("     then choose Open Live View.")
+                else:
+                    print("  1. Sign in to the Solari Console, open:")
+                    print(f"       {sessions_url}")
+                    print("     select the running session, then choose Open Live View.")
                 print()
-                print(f"  2. Interact with the page (clicks, typing, navigation).")
-                print(f"     Everything is recorded as rrweb events.")
+                print("  2. Click the live browser canvas to focus it, then interact")
+                print("     with the page (clicks, typing, navigation).")
+                print("     Everything is recorded as rrweb events.")
                 print()
-                print(f"  3. When you're done, press ENTER here to stop recording.")
+                print("  3. When you're done, press ENTER here to stop recording.")
                 print()
                 # Use a thread for input() so the asyncio loop stays alive.
                 loop = asyncio.get_event_loop()
@@ -138,6 +176,13 @@ async def main() -> None:
                 await ns["run"](page)
             else:
                 print("[record] no --manual or --actions; recording will contain only page load.")
+
+            if args.save_profile:
+                # Attaching a profile loads its state; it does not persist new
+                # cookies automatically. Save explicitly after the workflow.
+                state = await page.context.storage_state()
+                result = await solari.profiles.save(profile_id, state)
+                print(f"[record] saved profile {profile_id} v{result.version} ({result.size_bytes} bytes)")
 
             # Give rrweb a moment to flush its batched events.
             await asyncio.sleep(3)

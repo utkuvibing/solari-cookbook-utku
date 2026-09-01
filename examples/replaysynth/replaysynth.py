@@ -17,9 +17,9 @@ Locator strategy (in priority order):
   3. [name] / [placeholder] / [aria-label]
   4. associated <label>   -> page.get_by_label(...)
   5. button/a text        -> page.get_by_role("button"|"link", name=...)
-  6. explicit [role]      -> page.get_by_role(role, name=...)
-  7. visible text         -> page.get_by_text(...)
-  8. structural path      -> page.locator("form > ...")
+  6. explicit [role] / native headings -> page.get_by_role(...)
+  7. visible text          -> page.get_by_text(...)
+  8. structural path       -> page.locator("form > ...")
 
 Run as a module:
     python -m replaysynth fixture.ndjson  -> writes replay.py to stdout
@@ -182,21 +182,21 @@ class Locator:
     kind: str  # css | role | label | text
     value: str  # CSS selector, or ARIA role, or label/text content
     name: Optional[str] = None  # accessible name for role locators
+    exact: bool = False  # exact accessible-name match for safe semantic locators
 
     def emit(self) -> str:
         """Emit the exact Playwright Python expression.
 
-        Role locators deliberately do NOT use exact=True: the accessible name
-        is computed by the browser (whitespace-normalized, aria-label aware),
-        and our name comes from rrweb's raw textContent which often carries
-        leading/trailing whitespace. Playwright's default matching is
-        normalized substring — the robust choice for replay.
+        Role locators default to substring matching for browser-computed
+        accessible names. Native headings opt into exact matching because a
+        shorter heading can otherwise match a longer sibling heading.
         """
         if self.kind == "css":
             return f'page.locator("{_py_str(self.value)}")'
         if self.kind == "role":
             if self.name:
-                return f'page.get_by_role("{_py_str(self.value)}", name="{_py_str(self.name)}")'
+                exact = ", exact=True" if self.exact else ""
+                return f'page.get_by_role("{_py_str(self.value)}", name="{_py_str(self.name)}"{exact})'
             return f'page.get_by_role("{_py_str(self.value)}")'
         if self.kind == "label":
             return f'page.get_by_label("{_py_str(self.value)}")'
@@ -234,25 +234,41 @@ def _all_text(node: Node) -> str:
 
 
 def _label_for(node: Node) -> Optional[str]:
-    """A label[for=X] whose `for` matches this control's id/name."""
+    """Return the accessible label for a form control, if one is available.
+
+    Playwright's ``get_by_label`` supports both HTML label forms: a control
+    nested inside ``<label>`` and a separate ``<label for=...>``. rrweb gives
+    us the reconstructed parent/child tree, so handle the nested form first,
+    then search the whole containing form for an explicit association.
+    """
+    parent = node.parent
+    while parent:
+        if parent.is_element and parent.tag == "label":
+            text = " ".join(_all_text(parent).split())
+            return text or None
+        parent = parent.parent
+
     form = None
-    p = node.parent
-    while p:
-        if p.is_element and p.tag == "form":
-            form = p
+    parent = node.parent
+    while parent:
+        if parent.is_element and parent.tag == "form":
+            form = parent
             break
-        p = p.parent
+        parent = parent.parent
     if form is None or not node.attrs:
         return None
     target = node.attrs.get("id") or node.attrs.get("name")
     if not target:
         return None
-    for cand in form.children:
-        if cand.is_element and cand.tag == "label":
-            for_ = cand.attrs.get("for")
-            if for_ == target:
-                txt = _visible_text(cand)
-                return txt or None
+
+    stack = list(form.children)
+    while stack:
+        candidate = stack.pop()
+        if candidate.is_element and candidate.tag == "label":
+            if candidate.attrs.get("for") == target:
+                text = " ".join(_all_text(candidate).split())
+                return text or None
+        stack.extend(candidate.children)
     return None
 
 
@@ -311,12 +327,19 @@ def synthesize(node: Node) -> Optional[Locator]:
     if role:
         return Locator("role", role, name=_display_text(node) or None)
 
-    # Tier 6: visible text on text-carrying elements.
+    # Tier 6: native heading role with exact accessible name. This avoids
+    # get_by_text overmatching a shorter heading contained in another heading.
+    if node.tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        text = _display_text(node)
+        if text:
+            return Locator("role", "heading", name=text, exact=True)
+
+    # Tier 7: visible text on text-carrying elements.
     text = _display_text(node)
-    if text and node.tag in ("span", "summary", "li", "h1", "h2", "h3", "h4", "p", "td", "th", "div"):
+    if text and node.tag in ("span", "summary", "li", "p", "td", "th", "div"):
         return Locator("text", text)
 
-    # Tier 7: structural path — tag + nth-of-type within its parent.
+    # Tier 8: structural path — tag + nth-of-type within its parent.
     return Locator("css", structural_path(node))
 
 

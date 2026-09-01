@@ -29,7 +29,7 @@ export SOLARI_API_KEY=slr_live_...   # https://console.getsolari.com
 
 ### 1. Record
 
-Manual mode — a human drives the live session through the Solari console:
+Manual mode — drive the live session through the Solari console:
 
 ```bash
 python record.py --url "https://the-internet.herokuapp.com/login" \
@@ -37,12 +37,17 @@ python record.py --url "https://the-internet.herokuapp.com/login" \
                  --out session.ndjson
 ```
 
-This prints the console live-view URL for the session; you click through the
-workflow there, then press ENTER. The recording is downloaded when the session
-releases.
+`record.py` prints the supported console URL:
+`https://console.getsolari.com/sessions/<UUID>/live`. Sign in to the
+console, open that live view, interact with the page, then press ENTER here.
+The recording is downloaded when the session releases. Browser-session console
+input availability depends on the console surface; verify that keyboard events
+are arriving before using this mode for a form workflow.
 
 Deterministic mode — a Playwright actions file drives the session instead
-(useful for repeatable tests of the synthesizer itself):
+(useful for repeatable tests of the synthesizer itself). The example action
+file reads `DEMO_USERNAME` and `DEMO_PASSWORD` only from the runtime
+environment:
 
 ```bash
 python record.py --url "https://the-internet.herokuapp.com/login" \
@@ -55,7 +60,7 @@ python record.py --url "https://the-internet.herokuapp.com/login" \
 ```bash
 python replay.py --replay session.ndjson \
                  --url "https://the-internet.herokuapp.com/login" \
-                 --secret password=hunter2
+                 --secret password="$REPLAY_PASSWORD"
 ```
 
 `--secret NAME=VALUE` fills the password fields rrweb masks to `[REDACTED]` —
@@ -70,16 +75,33 @@ python replaysynth.py session.ndjson --replay-only --out replay.py
 
 ## Profiles: what's proven vs. what's supported
 
-A Solari **profile** stores cookies/localStorage across sessions. The intended
-authenticated-flow pattern is:
+A Solari **profile** stores cookies/localStorage across sessions. Attaching a
+profile loads its state, but it does not automatically save changes. Use the
+explicit `--save-profile` flag after the one-time authentication run:
 
-1. Record session A with `--profile login` and authenticate (manually or via
-   actions). The profile now holds the logged-in state.
-2. Record session B with the **same profile** — you're already logged in — and
-   perform the *post-login* workflow.
-3. Synthesize session B and replay it on a fresh browser with
-   `--profile login`. The generated script contains only the post-login steps;
-   no credentials are needed or present.
+```bash
+python record.py --url "https://the-internet.herokuapp.com/login" \
+                 --actions actions_login.py \
+                 --profile login \
+                 --save-profile \
+                 --out auth.ndjson
+```
+
+Then record only the post-login workflow with the same profile:
+
+```bash
+python record.py --url "https://the-internet.herokuapp.com/secure" \
+                 --actions actions_post_login.py \
+                 --profile login \
+                 --out post_login.ndjson
+python replay.py --replay post_login.ndjson \
+                 --profile login \
+                 --url "https://the-internet.herokuapp.com/secure"
+```
+
+The profile-backed page is created from the SDK-returned storage state. The
+synthesized script contains only the post-login steps; no credentials are
+needed or present.
 
 Note the boundary: replaying a recording that *contains* the login form steps
 against an already-authenticated profile may fail, because the site redirects
